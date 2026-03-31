@@ -99,6 +99,11 @@ static constexpr int LINE_H = 14;
 static constexpr int MP3_VIS_TOP = 38;
 static constexpr int MP3_VIS_BOTTOM_MARGIN = 14;
 static constexpr uint32_t kMp3PauseToggleDebounceMs = 450;
+static constexpr int kSpeakerVolumeStep = 5;
+static constexpr int kStartupVolumePct = 20;
+// Matrix backup for top row: _key_value_map row 0 has '-' at x=10, '=' at x=11 (x=12 is Backspace). If
+// your unit’s wiring matches the swapped keycaps vs this map, set true (then x=11 is "down", x=10 "up").
+static constexpr bool kVolumeMinusPlusMatrixColsSwapped = true;
 
 static MjpegClass g_mjpeg;
 static uint8_t *g_mjpegBuf = nullptr;
@@ -111,9 +116,12 @@ static bool g_folderAutoplay = false;
 
 static uint32_t g_mp3VolHintUntil = 0;
 static bool g_mp3VolHintActive = false;
+static uint32_t g_mp3LoopHintUntil = 0;
+static bool g_mp3LoopHintActive = false;
+static bool g_mp3LoopHintState = false;
 
 // Last user speaker level (0–255); survives MP3 I2S teardown and track changes (restore used to reset to session-start vol).
-static int g_speakerVolumePersist = 100;
+static int g_speakerVolumePersist = kStartupVolumePct * 255 / 100;
 
 // Matrix viz timing — must appear before mp3PollAllKeys (Arduino injects prototypes; later statics are out of scope there).
 static uint32_t g_mp3MatrixLastAdvanceMs = 0;
@@ -127,8 +135,85 @@ static void setSpeakerVolumePersisted(int v) {
 
 // After Tab/Esc exits MP3/video, the key can still be down; ignore UP_DIR from Tab/Esc until released (avoids WDT/spurious nav).
 static bool g_menuSuppressTabEscUpDir = false;
+// After exiting playback, Enter can remain electrically "stuck" for a frame and re-open media immediately.
+// Ignore Enter until it is fully released once.
+static bool g_menuSuppressEnterUntilRelease = false;
+static uint32_t g_menuSuppressEnterUntilMs = 0;
+static constexpr uint32_t kMenuEnterReleaseGuardMs = 350u;
+static uint32_t g_menuLastEnterAtMs = 0;
+static constexpr uint32_t kMenuEnterMinGapMs = 120u;
 
-static void markPlaybackReturnedToMenu() { g_menuSuppressTabEscUpDir = true; }
+static void markPlaybackReturnedToMenu() {
+  g_menuSuppressTabEscUpDir = true;
+  g_menuSuppressEnterUntilRelease = true;
+  g_menuSuppressEnterUntilMs = millis() + kMenuEnterReleaseGuardMs;
+}
+
+static bool tabKeyHeldPhysical() {
+  // Some firmware builds can report Tab with slightly different matrix coordinates.
+  for (const Point2D_t &p : M5Cardputer.Keyboard.keyList()) {
+    if ((p.x == 0 && p.y == 1) || (p.x == 1 && p.y == 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool tabEscHeldNow(const Keyboard_Class::KeysState &st) {
+  return st.tab || hidHas(st.hid_keys, HID_ESC) || tabKeyHeldPhysical();
+}
+
+static bool tabEscBackRequested(const Keyboard_Class::KeysState &st) {
+  if (tabEscHeldNow(st)) {
+    return true;
+  }
+  for (char c : st.word) {
+    if (c == 27 || c == '\t') {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool tabEscBackHeldOnly(const Keyboard_Class::KeysState &st) {
+  // Playback path must be strict to avoid false BACK triggers from noisy matrix cells.
+  return st.tab || hidHas(st.hid_keys, HID_ESC);
+}
+
+static bool playbackBackEdge(const Keyboard_Class::KeysState &st, bool &backArmed, bool &backPrevHeld,
+                             uint32_t playbackStartMs) {
+  const bool backHeld = tabEscBackHeldOnly(st);
+  if (!backArmed) {
+    // Rearm once key is released, or after startup guard timeout.
+    if (!backHeld || (millis() - playbackStartMs) >= 450u) {
+      backArmed = true;
+    }
+  }
+  const bool backPressed = backArmed && backHeld && !backPrevHeld;
+  backPrevHeld = backHeld;
+  return backPressed;
+}
+
+static bool enterHeldNow(const Keyboard_Class::KeysState &st) {
+  if (st.enter) {
+    return true;
+  }
+  for (const Point2D_t &p : M5Cardputer.Keyboard.keyList()) {
+    if (p.x == 13 && p.y == 2) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool enterPressedEdgeNow() {
+  for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
+    if (p.x == 13 && p.y == 2) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // Cardputer ADV: M5 Speaker + ES8311 path needs heap for I2S + spk_task; re-init after MP3 I2S teardown.
 static bool restoreCardputerSpeakerAfterMp3(int vol) {
@@ -453,29 +538,32 @@ static bool hidHas(const std::vector<uint8_t> &hid, uint8_t code) {
 
 // Caller must run M5Cardputer.update() and Keyboard.updateKeysState() first (same frame).
 static bool systemInfoKeysHeld() {
-  return M5Cardputer.Keyboard.isKeyPressed('0') || M5Cardputer.Keyboard.isKeyPressed('i') ||
-         M5Cardputer.Keyboard.isKeyPressed('I');
+  // Physical coordinates are more reliable than char translation on this keyboard.
+  for (const Point2D_t &p : M5Cardputer.Keyboard.keyList()) {
+    if ((p.x == 10 && p.y == 0) || (p.x == 8 && p.y == 1)) {  // '0' or 'i'
+      return true;
+    }
+  }
+  return false;
 }
 
-static bool g_sysInfoArm = false;
-static uint32_t g_sysInfoArmAtMs = 0;
-static constexpr uint32_t kSysInfoHoldBeforeShowMs = 55;
+static bool g_sysInfoOverlayVisible = false;
 
-// True once 0/i have been held continuously for kSysInfoHoldBeforeShowMs (reduces chatter / repeat).
-// Resets when keys release. Caller must still use systemInfoKeysHeld() for the inner "while showing" loop.
-static bool systemInfoRequestOverlay() {
-  const bool down = systemInfoKeysHeld();
-  const uint32_t now = millis();
-  if (!down) {
-    g_sysInfoArm = false;
-    return false;
+static bool systemInfoTogglePressedEdge() {
+  for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
+    if ((p.x == 10 && p.y == 0) || (p.x == 8 && p.y == 1)) {  // '0' or 'i'
+      return true;
+    }
   }
-  if (!g_sysInfoArm) {
-    g_sysInfoArm = true;
-    g_sysInfoArmAtMs = now;
-    return false;
+  return false;
+}
+
+// Press 0/i once to show system info; press again to hide.
+static bool systemInfoOverlayActive() {
+  if (systemInfoTogglePressedEdge()) {
+    g_sysInfoOverlayVisible = !g_sysInfoOverlayVisible;
   }
-  return (now - g_sysInfoArmAtMs) >= kSysInfoHoldBeforeShowMs;
+  return g_sysInfoOverlayVisible;
 }
 
 static void drawSystemInfoScreen() {
@@ -483,7 +571,7 @@ static void drawSystemInfoScreen() {
   d.fillScreen(TFT_BLACK);
   d.setTextSize(1);
   d.setTextColor(TFT_CYAN, TFT_BLACK);
-  d.drawString("System info (release key)", 4, 2);
+  d.drawString("System info (0/i toggle)", 4, 2);
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   int y = 16;
   char line[44];
@@ -569,15 +657,178 @@ static void showStartupSplash() {
   delay(1600);
 }
 
-static void handleVolumeKeys(bool keyChanged) {
-  if (!keyChanged) {
+// Last unambiguous volume direction seen from pressEvents().
+// -1 = down, +1 = up, 0 = unknown.
+static int g_volLastDir = 0;
+static bool g_volDownHeldPrev = false;
+static bool g_volUpHeldPrev = false;
+
+static void showVolumeHintNow() {
+  // Each press restarts the timer so rapid clicks keep the OSD alive; long enough to read final %.
+  g_mp3VolHintUntil = millis() + 2600u;
+  g_mp3VolHintActive = true;
+}
+
+static bool keyValueMeansVolDown(const KeyValue_t &kv) {
+  return kv.value_first == '-' || kv.value_first == '_' || kv.value_second == '_';
+}
+
+static bool keyValueMeansVolUp(const KeyValue_t &kv) {
+  return kv.value_first == '=' || kv.value_first == '+' || kv.value_second == '+';
+}
+
+static bool byteMeansVolDown(uint8_t kch) {
+  return kch == static_cast<uint8_t>('-') || kch == static_cast<uint8_t>('_');
+}
+
+static bool byteMeansVolUp(uint8_t kch) {
+  return kch == static_cast<uint8_t>('=') || kch == static_cast<uint8_t>('+');
+}
+
+// Fallback if coordinates differ from stock map (optional; logical key scan usually wins).
+static bool volMatrixCellIsDown(const Point2D_t &p) {
+  if (kVolumeMinusPlusMatrixColsSwapped) {
+    return p.x == 11 && p.y == 0;
+  }
+  return p.x == 10 && p.y == 0;
+}
+
+static bool volMatrixCellIsUp(const Point2D_t &p) {
+  if (kVolumeMinusPlusMatrixColsSwapped) {
+    return p.x == 10 && p.y == 0;
+  }
+  return p.x == 11 && p.y == 0;
+}
+
+// Volume: `-` / `_` lower; `=` / `+` raise. ADV (TCA8418) can report keys where getKeyValue() at the
+// coordinate does not match the shifted character — use getKey(p) + keysState.word + matrix cells.
+static void pollVolumeKeysMatrix(AudioOutputI2S *applyGainTo) {
+  const bool heldDownChars = M5Cardputer.Keyboard.isKeyPressed('-') ||
+                             M5Cardputer.Keyboard.isKeyPressed('_');
+  const bool heldUpChars =
+      M5Cardputer.Keyboard.isKeyPressed('=') || M5Cardputer.Keyboard.isKeyPressed('+');
+  bool matrixDownNow = false;
+  bool matrixUpNow = false;
+  for (const Point2D_t &p : M5Cardputer.Keyboard.keyList()) {
+    if (volMatrixCellIsDown(p)) {
+      matrixDownNow = true;
+    }
+    if (volMatrixCellIsUp(p)) {
+      matrixUpNow = true;
+    }
+  }
+  const bool volDownNow = heldDownChars || matrixDownNow;
+  const bool volUpNow = heldUpChars || matrixUpNow;
+
+  const int d = kSpeakerVolumeStep;
+  bool peDown = false;
+  bool peUp = false;
+  // Use pressEvents iteration order as time proxy (TCA8418 FIFO drain).
+  int peLastDir = 0;
+  for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
+    int evDir = 0;  // -1 down, +1 up
+    const uint8_t kch = M5Cardputer.Keyboard.getKey(p);
+    if (byteMeansVolDown(kch)) {
+      evDir = -1;
+    }
+    if (byteMeansVolUp(kch)) {
+      evDir = +1;
+    }
+    if (evDir == 0) {
+      const KeyValue_t kv = M5Cardputer.Keyboard.getKeyValue(p);
+      if (keyValueMeansVolDown(kv)) {
+        evDir = -1;
+      } else if (keyValueMeansVolUp(kv)) {
+        evDir = +1;
+      }
+    }
+    if (evDir == 0) {
+      if (volMatrixCellIsDown(p)) {
+        evDir = -1;
+      } else if (volMatrixCellIsUp(p)) {
+        evDir = +1;
+      }
+    }
+    if (evDir < 0) {
+      peDown = true;
+      peLastDir = -1;
+    } else if (evDir > 0) {
+      peUp = true;
+      peLastDir = +1;
+    }
+  }
+
+  if (!peDown && !peUp) {
+    // Recovery path: if pressEvents temporarily stall, still step on held-state edges.
+    const bool downEdge = volDownNow && !g_volDownHeldPrev;
+    const bool upEdge = volUpNow && !g_volUpHeldPrev;
+    g_volDownHeldPrev = volDownNow;
+    g_volUpHeldPrev = volUpNow;
+    if (!downEdge && !upEdge) {
+      return;
+    }
+    int dir = 0;
+    if (downEdge && !upEdge) {
+      dir = -1;
+    } else if (!downEdge && upEdge) {
+      dir = +1;
+    } else if (heldUpChars && !heldDownChars) {
+      dir = +1;
+    } else if (heldDownChars && !heldUpChars) {
+      dir = -1;
+    } else if (g_volLastDir != 0) {
+      dir = g_volLastDir;
+    } else {
+      dir = -1;
+    }
+    int v = g_speakerVolumePersist;
+    if (dir < 0) {
+      v -= d;
+    } else if (dir > 0) {
+      v += d;
+    }
+    setSpeakerVolumePersisted(constrain(v, 0, 255));
+    showVolumeHintNow();
+    if (applyGainTo) {
+      applyI2sGainFromSpeakerVolume(applyGainTo);
+    }
     return;
   }
-  const int v = M5Cardputer.Speaker.getVolume();
-  if (M5Cardputer.Keyboard.isKeyPressed('-') || M5Cardputer.Keyboard.isKeyPressed('_')) {
-    setSpeakerVolumePersisted(v - 10);
-  } else if (M5Cardputer.Keyboard.isKeyPressed('=') || M5Cardputer.Keyboard.isKeyPressed('+')) {
-    setSpeakerVolumePersisted(v + 10);
+
+  // Exactly one step per press-edge.
+  int dir = 0;
+  if (peDown && !peUp) {
+    dir = -1;
+  } else if (!peDown && peUp) {
+    dir = +1;
+  } else if (peLastDir != 0) {
+    dir = peLastDir;
+  } else if (g_volLastDir != 0) {
+    dir = g_volLastDir;
+  } else {
+    dir = -1;
+  }
+
+  if (peDown && !peUp) {
+    g_volLastDir = -1;
+  } else if (!peDown && peUp) {
+    g_volLastDir = +1;
+  } else if (peLastDir != 0) {
+    g_volLastDir = peLastDir;
+  }
+  g_volDownHeldPrev = volDownNow;
+  g_volUpHeldPrev = volUpNow;
+
+  int v = g_speakerVolumePersist;
+  if (dir < 0) {
+    v -= d;
+  } else if (dir > 0) {
+    v += d;
+  }
+  setSpeakerVolumePersisted(constrain(v, 0, 255));
+  showVolumeHintNow();
+  if (applyGainTo) {
+    applyI2sGainFromSpeakerVolume(applyGainTo);
   }
 }
 
@@ -691,19 +942,24 @@ static void drawBrowser(const String &cwd, const std::vector<MediaEntry> &entrie
 // Caller runs M5Cardputer.update(), keyChanged = isChange(), updateKeysState().
 // Edge-detect L/A so keyboard repeat does not spin (continues that skip delay(10) → WDT reset).
 static MenuAction pollMenuKeys(bool keyChanged, bool &toggleLPrev, bool &toggleAPrev) {
+  (void)keyChanged;
   const auto &st = M5Cardputer.Keyboard.keysState();
+  static bool navUpPrev = false;
+  static bool navDownPrev = false;
+  static bool enterPrevHeld = false;
+  static uint32_t navLastMoveAtMs = 0;
+  static constexpr uint32_t kMenuNavMinGapMs = 85u;
 
   if (g_menuSuppressTabEscUpDir) {
-    const bool tabDown = st.tab || hidHas(st.hid_keys, HID_ESC);
-    bool tabInWord = false;
-    for (char c : st.word) {
-      if (c == 27 || c == '\t') {
-        tabInWord = true;
-        break;
-      }
-    }
-    if (!tabDown && !tabInWord) {
+    if (!tabEscHeldNow(st)) {
       g_menuSuppressTabEscUpDir = false;
+    }
+  }
+  if (g_menuSuppressEnterUntilRelease) {
+    const bool enterNow = enterHeldNow(st);
+    const bool timeoutElapsed = static_cast<int32_t>(millis() - g_menuSuppressEnterUntilMs) >= 0;
+    if (!enterNow || timeoutElapsed) {
+      g_menuSuppressEnterUntilRelease = false;
     }
   }
 
@@ -724,46 +980,118 @@ static MenuAction pollMenuKeys(bool keyChanged, bool &toggleLPrev, bool &toggleA
     toggleAPrev = false;
   }
 
-  if (!keyChanged) {
-    return MenuAction::NONE;
-  }
-
   if (!g_menuSuppressTabEscUpDir) {
-    if (st.tab || hidHas(st.hid_keys, HID_ESC)) {
+    if (tabEscBackRequested(st)) {
       return MenuAction::UP_DIR;
     }
-    for (char c : st.word) {
-      if (c == 27 || c == '\t') {
-        return MenuAction::UP_DIR;
+  }
+
+  // Enter in browser:
+  // - accept physical press-edge when available
+  // - fall back to held-state rising-edge if pressEvents are throttled
+  // - rate-limit slightly to avoid accidental double-open
+  const bool enterHeld = enterHeldNow(st);
+  const bool enterEdge = enterPressedEdgeNow();
+  const bool enterRising = enterHeld && !enterPrevHeld;
+  enterPrevHeld = enterHeld;
+  if (!g_menuSuppressEnterUntilRelease && (enterEdge || enterRising)) {
+    const uint32_t now = millis();
+    if ((now - g_menuLastEnterAtMs) >= kMenuEnterMinGapMs) {
+      g_menuLastEnterAtMs = now;
+      return MenuAction::ENTER;
+    }
+  }
+
+  // Fast one-step list navigation from held-state rising edges:
+  // '[' or ';' (and ':') => UP, ']' or '.' => DOWN.
+  bool navUpEdge = false;
+  bool navDownEdge = false;
+  int navLastDir = 0;  // -1 up, +1 down
+  for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
+    int evDir = 0;
+    const uint8_t kch = M5Cardputer.Keyboard.getKey(p);
+    if (kch == static_cast<uint8_t>('[') || kch == static_cast<uint8_t>(';') ||
+        kch == static_cast<uint8_t>(':')) {
+      evDir = -1;
+    } else if (kch == static_cast<uint8_t>(']') || kch == static_cast<uint8_t>('.')) {
+      evDir = +1;
+    }
+    if (evDir == 0) {
+      if ((p.x == 11 && p.y == 1) || (p.x == 11 && p.y == 2)) {
+        evDir = -1;
+      } else if ((p.x == 12 && p.y == 1) || (p.x == 11 && p.y == 3)) {
+        evDir = +1;
       }
     }
+    if (evDir < 0) {
+      navUpEdge = true;
+      navLastDir = -1;
+    } else if (evDir > 0) {
+      navDownEdge = true;
+      navLastDir = +1;
+    }
   }
-
-  if (st.enter) {
-    return MenuAction::ENTER;
-  }
-
-  if (hidHas(st.hid_keys, HID_UP)) {
-    return MenuAction::UP;
-  }
-  if (hidHas(st.hid_keys, HID_DOWN)) {
-    return MenuAction::DOWN;
-  }
-
-  for (char c : st.word) {
-    if (c == '[') {
+  const uint32_t navNowMs = millis();
+  if ((navNowMs - navLastMoveAtMs) >= kMenuNavMinGapMs) {
+    if (navUpEdge && !navDownEdge) {
+      navLastMoveAtMs = navNowMs;
       return MenuAction::UP;
     }
-    if (c == ']') {
+    if (!navUpEdge && navDownEdge) {
+      navLastMoveAtMs = navNowMs;
       return MenuAction::DOWN;
     }
+    if (navUpEdge && navDownEdge) {
+      navLastMoveAtMs = navNowMs;
+      return (navLastDir < 0) ? MenuAction::UP : MenuAction::DOWN;
+    }
   }
+
+  bool navUpNow = M5Cardputer.Keyboard.isKeyPressed('[') ||
+                  M5Cardputer.Keyboard.isKeyPressed(';') ||
+                  M5Cardputer.Keyboard.isKeyPressed(':');
+  bool navDownNow = M5Cardputer.Keyboard.isKeyPressed(']') ||
+                    M5Cardputer.Keyboard.isKeyPressed('.');
+  for (const Point2D_t &p : M5Cardputer.Keyboard.keyList()) {
+    if ((p.x == 11 && p.y == 1) || (p.x == 11 && p.y == 2)) {  // '[' or ';' / ':'
+      navUpNow = true;
+    } else if ((p.x == 12 && p.y == 1) || (p.x == 11 && p.y == 3)) {  // ']' or '.'
+      navDownNow = true;
+    }
+  }
+  if (navUpNow && !navUpPrev) {
+    if ((navNowMs - navLastMoveAtMs) < kMenuNavMinGapMs) {
+      navUpPrev = navUpNow;
+      navDownPrev = navDownNow;
+      return MenuAction::NONE;
+    }
+    navLastMoveAtMs = navNowMs;
+    navUpPrev = navUpNow;
+    navDownPrev = navDownNow;
+    return MenuAction::UP;
+  }
+  if (navDownNow && !navDownPrev) {
+    if ((navNowMs - navLastMoveAtMs) < kMenuNavMinGapMs) {
+      navUpPrev = navUpNow;
+      navDownPrev = navDownNow;
+      return MenuAction::NONE;
+    }
+    navLastMoveAtMs = navNowMs;
+    navUpPrev = navUpNow;
+    navDownPrev = navDownNow;
+    return MenuAction::DOWN;
+  }
+  navUpPrev = navUpNow;
+  navDownPrev = navDownNow;
+
   return MenuAction::NONE;
 }
 
 // Caller runs M5Cardputer.update(), then keyChanged = Keyboard.isChange(), then updateKeysState().
-static PlayKey pollPlaybackKeys(bool keyChanged) {
-  handleVolumeKeys(keyChanged);
+static PlayKey pollPlaybackKeys(bool keyChanged, bool &backArmed, bool &backPrevHeld,
+                                uint32_t playbackStartMs) {
+  (void)keyChanged;
+  pollVolumeKeysMatrix(nullptr);
 
   if (M5Cardputer.BtnA.wasClicked()) {
     return PlayKey::PAUSE_TOGGLE;
@@ -771,13 +1099,8 @@ static PlayKey pollPlaybackKeys(bool keyChanged) {
 
   const auto &st = M5Cardputer.Keyboard.keysState();
 
-  if (st.tab || hidHas(st.hid_keys, HID_ESC)) {
+  if (playbackBackEdge(st, backArmed, backPrevHeld, playbackStartMs)) {
     return PlayKey::BACK_MENU;
-  }
-  for (char c : st.word) {
-    if (c == 27 || c == '\t') {
-      return PlayKey::BACK_MENU;
-    }
   }
   if (!keyChanged) {
     return PlayKey::NONE;
@@ -792,13 +1115,6 @@ static PlayKey pollPlaybackKeys(bool keyChanged) {
     if (c == 'a' || c == 'A') {
       return PlayKey::TOGGLE_AUTOPLAY;
     }
-  }
-
-  if (hidHas(st.hid_keys, HID_LEFT)) {
-    return PlayKey::SEEK_LEFT;
-  }
-  if (hidHas(st.hid_keys, HID_RIGHT)) {
-    return PlayKey::SEEK_RIGHT;
   }
 
   for (char c : st.word) {
@@ -837,27 +1153,25 @@ static bool applySeekBack(const String &videoPath, const String &pcmPath, File &
 
 static bool waitFramePace(bool waitSpeaker, bool &playing, uint32_t &frameStartMs,
                           const String &videoPath, const String &pcmPath, File &v, File &pcm,
-                          bool &pcmOpen, int &nextFrameIdx) {
+                          bool &pcmOpen, int &nextFrameIdx, bool &backArmed,
+                          bool &backPrevHeld, uint32_t playbackStartMs) {
   for (;;) {
     M5Cardputer.update();
     const bool keyChanged = M5Cardputer.Keyboard.isChange();
     M5Cardputer.Keyboard.updateKeysState();
-    if (systemInfoRequestOverlay()) {
+    if (systemInfoOverlayActive()) {
       if (pcmOpen) {
         M5Cardputer.Speaker.stop();
       }
       drawSystemInfoScreen();
-      while (systemInfoKeysHeld()) {
-        M5Cardputer.update();
-        M5Cardputer.Keyboard.updateKeysState();
-        delay(80);
-      }
-      g_mjpeg.drawJpg();
+      delay(20);
       frameStartMs = millis();
       continue;
     }
 
-    const PlayKey pk = pollPlaybackKeys(keyChanged);
+    const PlayKey pk = pollPlaybackKeys(keyChanged, backArmed, backPrevHeld, playbackStartMs);
+    drawMp3LoopHintTick();
+    drawMp3VolumeHintTick();
 
     if (pk == PlayKey::BACK_MENU) {
       return false;
@@ -868,6 +1182,7 @@ static bool waitFramePace(bool waitSpeaker, bool &playing, uint32_t &frameStartM
     if (pk == PlayKey::TOGGLE_LOOP) {
       g_loopEnabled = !g_loopEnabled;
       Serial.printf("Loop %s\n", g_loopEnabled ? "ON" : "OFF");
+      showLoopHintNow();
       continue;
     }
     if (pk == PlayKey::TOGGLE_AUTOPLAY) {
@@ -934,27 +1249,24 @@ static PlayExit playVideoFile(const String &videoPath) {
   bool playing = true;
   int nextFrameIdx = 0;
   PlayExit outcome = PlayExit::MENU;
+  bool backArmed = false;
+  bool backPrevHeld = false;
+  const uint32_t playbackStartMs = millis();
 
   for (;;) {
     if (!playing) {
       M5Cardputer.update();
       const bool keyChanged = M5Cardputer.Keyboard.isChange();
       M5Cardputer.Keyboard.updateKeysState();
-      if (systemInfoRequestOverlay()) {
+      if (systemInfoOverlayActive()) {
         if (pcmOpen) {
           M5Cardputer.Speaker.stop();
         }
         drawSystemInfoScreen();
-        while (systemInfoKeysHeld()) {
-          M5Cardputer.update();
-          M5Cardputer.Keyboard.updateKeysState();
-          delay(80);
-        }
-        g_mjpeg.drawJpg();
         delay(20);
         continue;
       }
-      const PlayKey pk = pollPlaybackKeys(keyChanged);
+      const PlayKey pk = pollPlaybackKeys(keyChanged, backArmed, backPrevHeld, playbackStartMs);
       if (pk == PlayKey::BACK_MENU) {
         outcome = PlayExit::MENU;
         break;
@@ -965,6 +1277,7 @@ static PlayExit playVideoFile(const String &videoPath) {
       if (pk == PlayKey::TOGGLE_LOOP) {
         g_loopEnabled = !g_loopEnabled;
         Serial.printf("Loop %s\n", g_loopEnabled ? "ON" : "OFF");
+        showLoopHintNow();
       }
       if (pk == PlayKey::TOGGLE_AUTOPLAY) {
         g_folderAutoplay = !g_folderAutoplay;
@@ -975,11 +1288,20 @@ static PlayExit playVideoFile(const String &videoPath) {
       } else if (pk == PlayKey::SEEK_LEFT) {
         applySeekBack(videoPath, pcmPath, v, pcmFile, pcmOpen, nextFrameIdx);
       }
+      drawMp3LoopHintTick();
+      drawMp3VolumeHintTick();
       delay(20);
       continue;
     }
 
     uint32_t tFrame = millis();
+    // Video path does heavy SD read + JPEG decode/draw before `waitFramePace()`.
+    // That can delay keyboard polling enough to miss fast volume taps.
+    // Poll volume here once per outer loop iteration so `-/_` and `=+` feel closer
+    // to the MP3 path responsiveness.
+    M5Cardputer.update();
+    M5Cardputer.Keyboard.updateKeysState();
+    pollVolumeKeysMatrix(nullptr);
 
     bool fedSpeaker = false;
     if (pcmOpen && pcmFile.available()) {
@@ -1039,10 +1361,12 @@ static PlayExit playVideoFile(const String &videoPath) {
     }
 
     g_mjpeg.drawJpg();
+    drawMp3LoopHintTick();
+    drawMp3VolumeHintTick();
     nextFrameIdx++;
 
     if (!waitFramePace(fedSpeaker, playing, tFrame, videoPath, pcmPath, v, pcmFile, pcmOpen,
-                       nextFrameIdx)) {
+                       nextFrameIdx, backArmed, backPrevHeld, playbackStartMs)) {
       outcome = PlayExit::MENU;
       break;
     }
@@ -1058,48 +1382,19 @@ static PlayExit playVideoFile(const String &videoPath) {
   return outcome;
 }
 
-// Caller runs update(), keyChanged = isChange(), updateKeysState() before this (same frame as systemInfoKeysHeld).
-// P: only keyChanged + char in st.word, debounced — avoids repeat + flaky isKeyPressed. BtnA is one-shot from M5.
-// tabBackArmed: ignore Tab/Esc→menu until those keys are seen released once (or kMp3TabBackArmTimeoutMs), so a Tab
-// still down from leaving the browser does not instant-exit and thrash I2S (driver reboot on next song).
-static constexpr uint32_t kMp3TabBackArmTimeoutMs = 500u;
-
-static bool mp3TabEscKeysHeld() {
-  const auto &st = M5Cardputer.Keyboard.keysState();
-  if (st.tab || hidHas(st.hid_keys, HID_ESC)) {
-    return true;
-  }
-  for (char c : st.word) {
-    if (c == 27 || c == '\t') {
-      return true;
-    }
-  }
-  return false;
-}
-
 static PlayKey mp3PollAllKeys(AudioOutputI2S *out, Mp3VizMode &vizMode, bool &duckStaticNeedsRedraw,
-                              bool keyChanged, uint32_t &lastPauseToggleMs, bool &tabBackArmed,
-                              uint32_t mp3SessionStartMs) {
+                              bool keyChanged, uint32_t &lastPauseToggleMs, bool &backArmed,
+                              bool &backPrevHeld, uint32_t playbackStartMs) {
   const auto &st = M5Cardputer.Keyboard.keysState();
-  if (!tabBackArmed) {
-    if (!mp3TabEscKeysHeld() || (millis() - mp3SessionStartMs) >= kMp3TabBackArmTimeoutMs) {
-      tabBackArmed = true;
-    }
-  }
-  if (tabBackArmed) {
-    if (st.tab || hidHas(st.hid_keys, HID_ESC)) {
-      return PlayKey::BACK_MENU;
-    }
-    for (char c : st.word) {
-      if (c == 27 || c == '\t') {
-        return PlayKey::BACK_MENU;
-      }
-    }
+  if (playbackBackEdge(st, backArmed, backPrevHeld, playbackStartMs)) {
+    return PlayKey::BACK_MENU;
   }
 
   if (M5Cardputer.BtnA.wasClicked()) {
     return PlayKey::PAUSE_TOGGLE;
   }
+
+  pollVolumeKeysMatrix(out);
 
   const uint32_t now = millis();
   if (keyChanged) {
@@ -1117,12 +1412,6 @@ static PlayKey mp3PollAllKeys(AudioOutputI2S *out, Mp3VizMode &vizMode, bool &du
     return PlayKey::NONE;
   }
 
-  if (hidHas(st.hid_keys, HID_LEFT)) {
-    return PlayKey::SEEK_LEFT;
-  }
-  if (hidHas(st.hid_keys, HID_RIGHT)) {
-    return PlayKey::SEEK_RIGHT;
-  }
   if (vizMode == Mp3VizMode::MATRIX) {
     if (hidHas(st.hid_keys, HID_UP)) {
       // Shorter interval = faster rain
@@ -1153,21 +1442,6 @@ static PlayKey mp3PollAllKeys(AudioOutputI2S *out, Mp3VizMode &vizMode, bool &du
       }
       return PlayKey::NONE;
     }
-  }
-  const bool minus = M5Cardputer.Keyboard.isKeyPressed('-') || M5Cardputer.Keyboard.isKeyPressed('_');
-  const bool plus = M5Cardputer.Keyboard.isKeyPressed('=') || M5Cardputer.Keyboard.isKeyPressed('+');
-  if (minus || plus) {
-    int v = g_speakerVolumePersist;
-    if (minus) {
-      v = constrain(v - 10, 0, 255);
-    } else {
-      v = constrain(v + 10, 0, 255);
-    }
-    setSpeakerVolumePersisted(v);
-    applyI2sGainFromSpeakerVolume(out);
-    g_mp3VolHintUntil = millis() + 1400;
-    g_mp3VolHintActive = true;
-    return PlayKey::NONE;
   }
   for (char c : st.word) {
     if (c == 'l' || c == 'L') {
@@ -2038,9 +2312,12 @@ static bool mp3SeekByMs(AudioGeneratorMP3 *mp3, AudioFileSourceSD *file, AudioOu
 static void drawMp3VolumeHintTick() {
   auto &d = M5Cardputer.Display;
   const uint32_t now = millis();
+  constexpr int kVolOsdW = 62;
+  constexpr int kVolOsdH = 14;
+  const int volX = d.width() - kVolOsdW - 2;
   if (static_cast<int32_t>(now - g_mp3VolHintUntil) >= 0) {
     if (g_mp3VolHintActive) {
-      d.fillRect(d.width() - 56, 2, 54, 12, TFT_BLACK);
+      d.fillRect(volX, 1, kVolOsdW, kVolOsdH, TFT_BLACK);
       g_mp3VolHintActive = false;
     }
     return;
@@ -2049,10 +2326,48 @@ static void drawMp3VolumeHintTick() {
   const int rawV = g_speakerVolumePersist;
   const int pct = (rawV * 100) / 255;
   snprintf(buf, sizeof(buf), "Vol %d%%", pct);
-  d.fillRect(d.width() - 56, 2, 54, 12, TFT_BLACK);
-  d.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
+  const uint32_t rem = g_mp3VolHintUntil - now;
+  uint16_t col = TFT_GREENYELLOW;
+  if (rem < 380u) {
+    col = TFT_WHITE;
+  } else if (rem < 800u) {
+    col = TFT_GREEN;
+  } else if (rem < 1400u) {
+    col = TFT_GREENYELLOW;
+  }
+  d.fillRect(volX, 1, kVolOsdW, kVolOsdH, TFT_BLACK);
+  d.setTextColor(col, TFT_BLACK);
   d.setTextSize(1);
-  d.drawString(buf, d.width() - 54, 4);
+  d.drawString(buf, volX + 2, 4);
+}
+
+static void drawMp3LoopHintTick() {
+  auto &d = M5Cardputer.Display;
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - g_mp3LoopHintUntil) >= 0) {
+    if (g_mp3LoopHintActive) {
+      d.fillRect(3, 2, 72, 12, TFT_BLACK);
+      g_mp3LoopHintActive = false;
+    }
+    return;
+  }
+  const uint32_t rem = g_mp3LoopHintUntil - now;
+  uint16_t col = g_mp3LoopHintState ? TFT_GREENYELLOW : TFT_ORANGE;
+  if (rem < 450u) {
+    col = TFT_DARKGREY;
+  } else if (rem < 900u) {
+    col = g_mp3LoopHintState ? TFT_GREEN : TFT_YELLOW;
+  }
+  d.fillRect(3, 2, 72, 12, TFT_BLACK);
+  d.setTextColor(col, TFT_BLACK);
+  d.setTextSize(1);
+  d.drawString(g_mp3LoopHintState ? "Loop ON" : "Loop off", 5, 4);
+}
+
+static void showLoopHintNow() {
+  g_mp3LoopHintState = g_loopEnabled;
+  g_mp3LoopHintUntil = millis() + 1400u;
+  g_mp3LoopHintActive = true;
 }
 
 static PlayExit playMp3File(const String &path) {
@@ -2119,9 +2434,9 @@ static PlayExit playMp3File(const String &path) {
   Mp3VizMode mp3PrevVizMode = mp3VizMode;
   bool duckStaticNeedsRedraw = false;
   PlayExit outcome = PlayExit::MENU;
-  bool mp3TabBackArmed = false;
-  const uint32_t mp3SessionStartMs = millis();
-
+  bool backArmed = false;
+  bool backPrevHeld = false;
+  const uint32_t playbackStartMs = millis();
   for (;;) {
     M5Cardputer.update();
     applyI2sGainFromSpeakerVolume(out);
@@ -2141,17 +2456,13 @@ static PlayExit playMp3File(const String &path) {
     const bool keyChanged = M5Cardputer.Keyboard.isChange();
     M5Cardputer.Keyboard.updateKeysState();
 
-    if (systemInfoRequestOverlay()) {
+    if (systemInfoOverlayActive()) {
       const bool mp3HadAudio = !paused && mp3->isRunning();
       if (mp3HadAudio) {
         out->stop();
       }
       drawSystemInfoScreen();
-      while (systemInfoKeysHeld()) {
-        M5Cardputer.update();
-        M5Cardputer.Keyboard.updateKeysState();
-        delay(80);
-      }
+      delay(20);
       if (mp3HadAudio) {
         if (out->begin()) {
           applyI2sGainFromSpeakerVolume(out);
@@ -2180,7 +2491,8 @@ static PlayExit playMp3File(const String &path) {
     }
 
     const PlayKey pk = mp3PollAllKeys(out, mp3VizMode, duckStaticNeedsRedraw, keyChanged,
-                                      mp3LastPauseToggleMs, mp3TabBackArmed, mp3SessionStartMs);
+                                      mp3LastPauseToggleMs, backArmed, backPrevHeld,
+                                      playbackStartMs);
     if (mp3VizMode != mp3PrevVizMode) {
       if (mp3PrevVizMode == Mp3VizMode::DUCK_DANCE) {
         mp3GifClose();
@@ -2223,10 +2535,7 @@ static PlayExit playMp3File(const String &path) {
     if (pk == PlayKey::TOGGLE_LOOP) {
       g_loopEnabled = !g_loopEnabled;
       Serial.printf("Loop %s\n", g_loopEnabled ? "ON" : "OFF");
-      auto &d = M5Cardputer.Display;
-      d.fillRect(0, d.height() - 24, d.width(), 12, TFT_BLACK);
-      d.setTextColor(g_loopEnabled ? TFT_GREENYELLOW : TFT_DARKGREY, TFT_BLACK);
-      d.drawString(g_loopEnabled ? "Loop ON" : "Loop off", 4, d.height() - 22);
+      showLoopHintNow();
     }
     if (pk == PlayKey::TOGGLE_AUTOPLAY) {
       g_folderAutoplay = !g_folderAutoplay;
@@ -2264,6 +2573,7 @@ static PlayExit playMp3File(const String &path) {
         break;
     }
     drawMp3VolumeHintTick();
+    drawMp3LoopHintTick();
     drawMp3PlaybackTimeTick(mp3PlayedAccumMs, mp3SongTotalSec);
 
     if (!paused) {
@@ -2334,14 +2644,10 @@ static void runUiLoop() {
         if (millis() >= idleEnd && !systemInfoKeysHeld()) {
           break;
         }
-        if (systemInfoRequestOverlay()) {
+        if (systemInfoOverlayActive()) {
           M5Cardputer.Speaker.stop();
           drawSystemInfoScreen();
-          while (systemInfoKeysHeld()) {
-            M5Cardputer.update();
-            M5Cardputer.Keyboard.updateKeysState();
-            delay(80);
-          }
+          delay(20);
           M5Cardputer.Display.fillScreen(TFT_BLACK);
           M5Cardputer.Display.drawString("No media on SD", 4, 4);
         }
@@ -2358,6 +2664,8 @@ static void runUiLoop() {
 
     bool needRedraw = true;
     uint32_t lastNav = 0;
+    uint32_t lastListMoveMs = 0;
+    static constexpr uint32_t kListMoveDebounceMs = 0u;
     bool menuToggleLPrev = false;
     bool menuToggleAPrev = false;
 
@@ -2365,14 +2673,10 @@ static void runUiLoop() {
       M5Cardputer.update();
       const bool keyChanged = M5Cardputer.Keyboard.isChange();
       M5Cardputer.Keyboard.updateKeysState();
-      if (systemInfoRequestOverlay()) {
+      if (systemInfoOverlayActive()) {
         M5Cardputer.Speaker.stop();
         drawSystemInfoScreen();
-        while (systemInfoKeysHeld()) {
-          M5Cardputer.update();
-          M5Cardputer.Keyboard.updateKeysState();
-          delay(80);
-        }
+        delay(20);
         needRedraw = true;
         delay(10);
         continue;
@@ -2465,48 +2769,25 @@ static void runUiLoop() {
         break;
       }
       if (a == MenuAction::UP) {
-        if (sel > 0) {
+        if (sel > 0 && (millis() - lastListMoveMs) >= kListMoveDebounceMs) {
           sel--;
           needRedraw = true;
+          lastListMoveMs = millis();
         }
         lastNav = millis();
       } else if (a == MenuAction::DOWN) {
-        if (sel + 1 < static_cast<int>(entries.size())) {
+        if (sel + 1 < static_cast<int>(entries.size()) &&
+            (millis() - lastListMoveMs) >= kListMoveDebounceMs) {
           sel++;
           needRedraw = true;
+          lastListMoveMs = millis();
         }
         lastNav = millis();
       }
 
-      if (millis() - lastNav > 280u) {
-        M5Cardputer.update();
-        M5Cardputer.Keyboard.updateKeyList();
-        if (M5Cardputer.Keyboard.isPressed()) {
-          M5Cardputer.Keyboard.updateKeysState();
-          const auto &st = M5Cardputer.Keyboard.keysState();
-          bool up = hidHas(st.hid_keys, HID_UP);
-          bool down = hidHas(st.hid_keys, HID_DOWN);
-          for (char c : st.word) {
-            if (c == '[') {
-              up = true;
-            }
-            if (c == ']') {
-              down = true;
-            }
-          }
-          if (up && sel > 0) {
-            sel--;
-            needRedraw = true;
-            lastNav = millis();
-          } else if (down && sel + 1 < static_cast<int>(entries.size())) {
-            sel++;
-            needRedraw = true;
-            lastNav = millis();
-          }
-        }
-      }
+      // Hold-repeat removed: one move per press in browser list.
 
-      delay(10);
+      delay(1);
     }
   }
 }
@@ -2531,7 +2812,7 @@ void setup() {
   }
 
   M5Cardputer.Speaker.begin();
-  setSpeakerVolumePersisted(100);
+  setSpeakerVolumePersisted(kStartupVolumePct * 255 / 100);
 
 #if defined(ESP_PLATFORM)
   randomSeed(static_cast<uint32_t>(esp_random()));
