@@ -8,13 +8,14 @@
  * Video: P or BtnA pause; Tab/Esc = menu; , / or arrows seek; L/A as above; - = vol.
  * MP3: V cycles viz (bars / ducks / matrix: ASCII streams traverse MP3 band top→bottom; rot 1 → fall along logical X); , / or arrows seek (~1s); N/B = next/prev track in folder (stops at folder ends). Top-right time = elapsed/total when ID3 TLEN or Xing/Info present.
  * Hold 0 or i ~0.05s: system info (battery, etc.); release to resume. Audio is muted for that screen so the long draw cannot I2S-underrun (buzz). Overlay draws once; light poll while held.
- * Startup splash uses splash_duck_rgb565.h; matching PNG placeholder: assets/splash_duck_placeholder.png
+ * Startup splash uses splash_duck_rgb565.h; optional root SD clip /startTape.mp3 during splash (see kSplashJinglePath).
+ * Matching PNG placeholder: assets/splash_duck_placeholder.png
  *
  * MP3 needs: ESP8266Audio. AnimatedGIF (bitbank2) is bundled as AnimatedGIF.cpp / .h / gif.inl next to this sketch.
  * MP3 I2S: AudioOutputMeterI2S::begin() overrides ESP8266Audio to use I2S_NUM_1 (SPK_I2S_PORT) instead of
  * I2S_NUM_AUTO, and avoids assert() on alloc failure — fixes Tab→next MP3 reboot on Cardputer ADV.
  *
- * Convert video: scripts/mp4_to_cardputer_mjpeg.sh
+ * Convert video: scripts/mp4_to_car    puter_mjpeg.sh
  *$ ffmpeg -y -i Your.mp4   -vf "scale=240:135:force_original_aspect_ratio=increase,crop=240:135"   -r 15 -q:v 8 -an Your.mjpeg
  *$ ffmpeg -y -i Your.mp4   -map 0:a:0 -f u8 -acodec pcm_u8 -ar 44100 -ac 1 Your.pcm
  */
@@ -65,9 +66,9 @@ enum class PlayKey {
   TRACK_PREV,
 };
 
-enum class Mp3VizMode : uint8_t { BARS = 0, DUCK_STILL, DUCK_DANCE, MATRIX };
+enum class Mp3VizMode : uint8_t { BARS = 0, DUCK_STILL, DUCK_DANCE, MATRIX, WAVE };
 
-static constexpr uint8_t MP3_VIZ_MODE_COUNT = 4;
+static constexpr uint8_t MP3_VIZ_MODE_COUNT = 5;
 
 static constexpr int TARGET_FPS = 15;
 static constexpr uint32_t FRAME_MS = 1000 / TARGET_FPS;
@@ -101,6 +102,9 @@ static constexpr int MP3_VIS_BOTTOM_MARGIN = 14;
 static constexpr uint32_t kMp3PauseToggleDebounceMs = 450;
 static constexpr int kSpeakerVolumeStep = 5;
 static constexpr int kStartupVolumePct = 20;
+// Splash: play from SD card root (keeps flash free; small runtime heap only for decoder/I2S).
+static const char *const kSplashJinglePath = "/startTape.mp3";
+static constexpr uint32_t kSplashJingleMaxMs = 20000u;
 // Matrix backup for top row: _key_value_map row 0 has '-' at x=10, '=' at x=11 (x=12 is Backspace). If
 // your unit’s wiring matches the swapped keycaps vs this map, set true (then x=11 is "down", x=10 "up").
 static constexpr bool kVolumeMinusPlusMatrixColsSwapped = true;
@@ -119,6 +123,10 @@ static bool g_mp3VolHintActive = false;
 static uint32_t g_mp3LoopHintUntil = 0;
 static bool g_mp3LoopHintActive = false;
 static bool g_mp3LoopHintState = false;
+
+// Volume UI can cause short keyboard ghosting on ADV; if we see a "p" toggle during
+// that window, ignore it to prevent accidental pause when changing volume.
+static uint32_t g_ignorePauseToggleUntilMs = 0;
 
 // Last user speaker level (0–255); survives MP3 I2S teardown and track changes (restore used to reset to session-start vol).
 static int g_speakerVolumePersist = kStartupVolumePct * 255 / 100;
@@ -142,6 +150,11 @@ static uint32_t g_menuSuppressEnterUntilMs = 0;
 static constexpr uint32_t kMenuEnterReleaseGuardMs = 350u;
 static uint32_t g_menuLastEnterAtMs = 0;
 static constexpr uint32_t kMenuEnterMinGapMs = 120u;
+static bool g_trackNavAwaitRelease = false;
+static bool g_trackNavPrevN = false;
+static bool g_trackNavPrevB = false;
+// Video loop side-channel: +1 next, -1 prev, 0 none.
+static int g_videoTrackNavRequest = 0;
 
 static void markPlaybackReturnedToMenu() {
   g_menuSuppressTabEscUpDir = true;
@@ -161,6 +174,78 @@ static bool tabKeyHeldPhysical() {
 
 static bool tabEscHeldNow(const Keyboard_Class::KeysState &st) {
   return st.tab || hidHas(st.hid_keys, HID_ESC) || tabKeyHeldPhysical();
+}
+
+// Unified N/B track navigation detector (shared by MP3 + video paths).
+// Guarantees one physical press => one track step, requiring release before next step.
+static PlayKey pollTrackNavNextPrev() {
+  static uint32_t trackNavLatchedAtMs = 0;
+  static constexpr uint32_t kTrackNavLatchMaxMs = 900u;
+  bool nHeld = M5Cardputer.Keyboard.isKeyPressed('n') || M5Cardputer.Keyboard.isKeyPressed('N');
+  bool bHeld = M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed('B');
+
+  bool nEdge = false;
+  bool bEdge = false;
+  int lastDir = 0;  // +1 next, -1 prev
+
+  for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
+    const uint8_t kch = M5Cardputer.Keyboard.getKey(p);
+    const KeyValue_t kv = M5Cardputer.Keyboard.getKeyValue(p);
+    if (kch == static_cast<uint8_t>('n') || kch == static_cast<uint8_t>('N') ||
+        kv.value_first == 'n' || kv.value_second == 'N') {
+      nEdge = true;
+      lastDir = +1;
+    }
+    if (kch == static_cast<uint8_t>('b') || kch == static_cast<uint8_t>('B') ||
+        kv.value_first == 'b' || kv.value_second == 'B') {
+      bEdge = true;
+      lastDir = -1;
+    }
+  }
+
+  // Fallback edges when pressEvents miss an event under load.
+  if (nHeld && !g_trackNavPrevN) {
+    nEdge = true;
+    if (lastDir == 0) {
+      lastDir = +1;
+    }
+  }
+  if (bHeld && !g_trackNavPrevB) {
+    bEdge = true;
+    if (lastDir == 0) {
+      lastDir = -1;
+    }
+  }
+  g_trackNavPrevN = nHeld;
+  g_trackNavPrevB = bHeld;
+
+  const uint32_t now = millis();
+  if (!nHeld && !bHeld) {
+    g_trackNavAwaitRelease = false;
+  } else if (g_trackNavAwaitRelease && (now - trackNavLatchedAtMs) > kTrackNavLatchMaxMs) {
+    // Safety unlock for cases where video polling misses release transitions.
+    g_trackNavAwaitRelease = false;
+  }
+  if (g_trackNavAwaitRelease) {
+    return PlayKey::NONE;
+  }
+
+  if (nEdge && !bEdge) {
+    g_trackNavAwaitRelease = true;
+    trackNavLatchedAtMs = now;
+    return PlayKey::TRACK_NEXT;
+  }
+  if (bEdge && !nEdge) {
+    g_trackNavAwaitRelease = true;
+    trackNavLatchedAtMs = now;
+    return PlayKey::TRACK_PREV;
+  }
+  if (nEdge && bEdge) {
+    g_trackNavAwaitRelease = true;
+    trackNavLatchedAtMs = now;
+    return (lastDir >= 0) ? PlayKey::TRACK_NEXT : PlayKey::TRACK_PREV;
+  }
+  return PlayKey::NONE;
 }
 
 static bool tabEscBackRequested(const Keyboard_Class::KeysState &st) {
@@ -548,6 +633,8 @@ static bool systemInfoKeysHeld() {
 }
 
 static bool g_sysInfoOverlayVisible = false;
+static uint32_t g_sysInfoLastToggleMs = 0;
+static constexpr uint32_t kSysInfoToggleDebounceMs = 220u;
 
 static bool systemInfoTogglePressedEdge() {
   for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
@@ -560,13 +647,24 @@ static bool systemInfoTogglePressedEdge() {
 
 // Press 0/i once to show system info; press again to hide.
 static bool systemInfoOverlayActive() {
-  if (systemInfoTogglePressedEdge()) {
+  const uint32_t now = millis();
+  if (systemInfoTogglePressedEdge() &&
+      (now - g_sysInfoLastToggleMs) >= kSysInfoToggleDebounceMs) {
+    g_sysInfoLastToggleMs = now;
     g_sysInfoOverlayVisible = !g_sysInfoOverlayVisible;
   }
   return g_sysInfoOverlayVisible;
 }
 
 static void drawSystemInfoScreen() {
+  static uint32_t s_lastRedrawMs = 0;
+  static constexpr uint32_t kSysInfoRedrawIntervalMs = 260u;
+  const uint32_t now = millis();
+  if ((now - s_lastRedrawMs) < kSysInfoRedrawIntervalMs) {
+    return;
+  }
+  s_lastRedrawMs = now;
+
   auto &d = M5Cardputer.Display;
   d.fillScreen(TFT_BLACK);
   d.setTextSize(1);
@@ -639,7 +737,7 @@ static void drawSystemInfoScreen() {
 #endif
 }
 
-static void showStartupSplash() {
+static void drawStartupSplashFrame() {
   auto &d = M5Cardputer.Display;
   d.fillScreen(0x4D7B);
   const int dw = d.width();
@@ -654,7 +752,6 @@ static void showStartupSplash() {
   d.drawCenterString("Cardputer ADV", dw / 2, dh - 20);
   d.setTextColor(TFT_WHITE, 0x4D7B);
   d.drawCenterString("MJPEG / MP3", dw / 2, dh - 8);
-  delay(1600);
 }
 
 // Last unambiguous volume direction seen from pressEvents().
@@ -827,6 +924,7 @@ static void pollVolumeKeysMatrix(AudioOutputI2S *applyGainTo) {
   }
   setSpeakerVolumePersisted(constrain(v, 0, 255));
   showVolumeHintNow();
+  g_ignorePauseToggleUntilMs = millis() + 120u;
   if (applyGainTo) {
     applyI2sGainFromSpeakerVolume(applyGainTo);
   }
@@ -840,6 +938,69 @@ static void applyI2sGainFromSpeakerVolume(AudioOutputI2S *out) {
   // Cap gain below 3.5 to reduce clipping on loud MP3s; larger I2S DMA helps underrun crackle.
   const float g = constrain(v / 255.0f * 1.9f, 0.05f, 2.4f);
   out->SetGain(g);
+}
+
+// Optional short clip from SD during splash (same I2S handoff as full MP3 playback).
+static void playSplashJingleFromSdIfPresent() {
+  if (!SD.exists(kSplashJinglePath)) {
+    delay(1600);
+    return;
+  }
+  const int vol = g_speakerVolumePersist;
+  M5Cardputer.Speaker.stop();
+  M5Cardputer.Speaker.end();
+  delay(90);
+
+  auto *out = new AudioOutputMeterI2S(SPK_I2S_PORT);
+  auto *file = new AudioFileSourceSD();
+  auto *mp3 = new AudioGeneratorMP3();
+  if (!out || !file || !mp3) {
+    delete mp3;
+    delete file;
+    delete out;
+    restoreCardputerSpeakerAfterMp3(vol);
+    delay(1600);
+    return;
+  }
+  out->SetPinout(SPK_PIN_BCLK, SPK_PIN_LRCLK, SPK_PIN_DOUT);
+  out->SetOutputModeMono(true);
+#if defined(ESP32)
+  out->SetBuffers(12, 2304);
+#endif
+  applyI2sGainFromSpeakerVolume(out);
+
+  if (!file->open(kSplashJinglePath) || !mp3->begin(file, out)) {
+    mp3->stop();
+    file->close();
+    delete mp3;
+    delete file;
+    out->stop();
+    delay(40);
+    delete out;
+    restoreCardputerSpeakerAfterMp3(vol);
+    delay(1600);
+    return;
+  }
+
+  const uint32_t jingleStarted = millis();
+  while (mp3->isRunning()) {
+    if (millis() - jingleStarted > kSplashJingleMaxMs) {
+      break;
+    }
+    if (!mp3->loop()) {
+      break;
+    }
+    yield();
+    delay(1);
+  }
+  mp3->stop();
+  file->close();
+  delete mp3;
+  delete file;
+  out->stop();
+  delay(40);
+  delete out;
+  restoreCardputerSpeakerAfterMp3(vol);
 }
 
 static bool skipOneJpegFrame(File &v) {
@@ -1102,11 +1263,19 @@ static PlayKey pollPlaybackKeys(bool keyChanged, bool &backArmed, bool &backPrev
   if (playbackBackEdge(st, backArmed, backPrevHeld, playbackStartMs)) {
     return PlayKey::BACK_MENU;
   }
+  const PlayKey nb = pollTrackNavNextPrev();
+  if (nb == PlayKey::TRACK_NEXT || nb == PlayKey::TRACK_PREV) {
+    return nb;
+  }
   if (!keyChanged) {
     return PlayKey::NONE;
   }
+  const uint32_t now = millis();
   for (char c : st.word) {
     if (c == 'p' || c == 'P') {
+      if (static_cast<int32_t>(now - g_ignorePauseToggleUntilMs) < 0) {
+        break;
+      }
       return PlayKey::PAUSE_TOGGLE;
     }
     if (c == 'l' || c == 'L') {
@@ -1202,6 +1371,14 @@ static bool waitFramePace(bool waitSpeaker, bool &playing, uint32_t &frameStartM
       frameStartMs = millis();
       continue;
     }
+    if (pk == PlayKey::TRACK_NEXT) {
+      g_videoTrackNavRequest = +1;
+      return false;
+    }
+    if (pk == PlayKey::TRACK_PREV) {
+      g_videoTrackNavRequest = -1;
+      return false;
+    }
 
     if (!playing) {
       return true;
@@ -1252,6 +1429,7 @@ static PlayExit playVideoFile(const String &videoPath) {
   bool backArmed = false;
   bool backPrevHeld = false;
   const uint32_t playbackStartMs = millis();
+  g_videoTrackNavRequest = 0;
 
   for (;;) {
     if (!playing) {
@@ -1287,6 +1465,12 @@ static PlayExit playVideoFile(const String &videoPath) {
         applySeekForward(v, pcmFile, pcmOpen, nextFrameIdx);
       } else if (pk == PlayKey::SEEK_LEFT) {
         applySeekBack(videoPath, pcmPath, v, pcmFile, pcmOpen, nextFrameIdx);
+      } else if (pk == PlayKey::TRACK_NEXT) {
+        outcome = PlayExit::TRACK_NEXT;
+        break;
+      } else if (pk == PlayKey::TRACK_PREV) {
+        outcome = PlayExit::TRACK_PREV;
+        break;
       }
       drawMp3LoopHintTick();
       drawMp3VolumeHintTick();
@@ -1302,6 +1486,11 @@ static PlayExit playVideoFile(const String &videoPath) {
     M5Cardputer.update();
     M5Cardputer.Keyboard.updateKeysState();
     pollVolumeKeysMatrix(nullptr);
+    const PlayKey nb = pollTrackNavNextPrev();
+    if (nb == PlayKey::TRACK_NEXT || nb == PlayKey::TRACK_PREV) {
+      outcome = (nb == PlayKey::TRACK_NEXT) ? PlayExit::TRACK_NEXT : PlayExit::TRACK_PREV;
+      break;
+    }
 
     bool fedSpeaker = false;
     if (pcmOpen && pcmFile.available()) {
@@ -1367,7 +1556,14 @@ static PlayExit playVideoFile(const String &videoPath) {
 
     if (!waitFramePace(fedSpeaker, playing, tFrame, videoPath, pcmPath, v, pcmFile, pcmOpen,
                        nextFrameIdx, backArmed, backPrevHeld, playbackStartMs)) {
-      outcome = PlayExit::MENU;
+      if (g_videoTrackNavRequest > 0) {
+        outcome = PlayExit::TRACK_NEXT;
+      } else if (g_videoTrackNavRequest < 0) {
+        outcome = PlayExit::TRACK_PREV;
+      } else {
+        outcome = PlayExit::MENU;
+      }
+      g_videoTrackNavRequest = 0;
       break;
     }
   }
@@ -1396,10 +1592,19 @@ static PlayKey mp3PollAllKeys(AudioOutputI2S *out, Mp3VizMode &vizMode, bool &du
 
   pollVolumeKeysMatrix(out);
 
+  const PlayKey nb = pollTrackNavNextPrev();
+  if (nb == PlayKey::TRACK_NEXT || nb == PlayKey::TRACK_PREV) {
+    return nb;
+  }
+
   const uint32_t now = millis();
   if (keyChanged) {
     for (char c : st.word) {
       if (c == 'p' || c == 'P') {
+        if (static_cast<int32_t>(now - g_ignorePauseToggleUntilMs) < 0) {
+          // Ignore accidental pause toggles shortly after volume input.
+          break;
+        }
         // Debounce here only; playMp3File stamps lastPauseToggleMs on any pause (incl. BtnA).
         if (now - lastPauseToggleMs >= kMp3PauseToggleDebounceMs) {
           return PlayKey::PAUSE_TOGGLE;
@@ -1408,6 +1613,19 @@ static PlayKey mp3PollAllKeys(AudioOutputI2S *out, Mp3VizMode &vizMode, bool &du
       }
     }
   }
+
+  // `V` / `v`: cycle visual mode (edge-based for responsiveness on ADV).
+  for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
+    const uint8_t kch = M5Cardputer.Keyboard.getKey(p);
+    if (kch == static_cast<uint8_t>('v') || kch == static_cast<uint8_t>('V')) {
+      vizMode = static_cast<Mp3VizMode>((static_cast<uint8_t>(vizMode) + 1u) % MP3_VIZ_MODE_COUNT);
+      if (vizMode == Mp3VizMode::DUCK_STILL) {
+        duckStaticNeedsRedraw = true;
+      }
+      return PlayKey::NONE;
+    }
+  }
+
   if (!keyChanged) {
     return PlayKey::NONE;
   }
@@ -1434,13 +1652,14 @@ static PlayKey mp3PollAllKeys(AudioOutputI2S *out, Mp3VizMode &vizMode, bool &du
     }
   }
 
-  for (char c : st.word) {
-    if (c == 'v' || c == 'V') {
-      vizMode = static_cast<Mp3VizMode>((static_cast<uint8_t>(vizMode) + 1u) % MP3_VIZ_MODE_COUNT);
-      if (vizMode == Mp3VizMode::DUCK_STILL) {
-        duckStaticNeedsRedraw = true;
-      }
-      return PlayKey::NONE;
+  // Prioritize loop/autoplay toggles over viz-cycle to avoid ghosting-triggered V changes.
+  for (const Point2D_t &p : M5Cardputer.Keyboard.pressEvents()) {
+    const uint8_t kch = M5Cardputer.Keyboard.getKey(p);
+    if (kch == static_cast<uint8_t>('l') || kch == static_cast<uint8_t>('L')) {
+      return PlayKey::TOGGLE_LOOP;
+    }
+    if (kch == static_cast<uint8_t>('a') || kch == static_cast<uint8_t>('A')) {
+      return PlayKey::TOGGLE_AUTOPLAY;
     }
   }
   for (char c : st.word) {
@@ -1450,11 +1669,15 @@ static PlayKey mp3PollAllKeys(AudioOutputI2S *out, Mp3VizMode &vizMode, bool &du
     if (c == 'a' || c == 'A') {
       return PlayKey::TOGGLE_AUTOPLAY;
     }
-    if (c == 'n' || c == 'N') {
-      return PlayKey::TRACK_NEXT;
-    }
-    if (c == 'b' || c == 'B') {
-      return PlayKey::TRACK_PREV;
+  }
+
+  for (char c : st.word) {
+    if (c == 'v' || c == 'V') {
+      vizMode = static_cast<Mp3VizMode>((static_cast<uint8_t>(vizMode) + 1u) % MP3_VIZ_MODE_COUNT);
+      if (vizMode == Mp3VizMode::DUCK_STILL) {
+        duckStaticNeedsRedraw = true;
+      }
+      return PlayKey::NONE;
     }
   }
   return PlayKey::NONE;
@@ -1969,7 +2192,10 @@ static void drawMp3MatrixRainTick(bool paused, volatile uint32_t *envPtr) {
     }
   }
 
-  d.fillRect(0, yTop, vizW, vizH, TFT_BLACK);
+  // Clear from the MP3 band top down to the bottom of the screen.
+  // The ASCII glyph renderer can draw a few pixels past our computed band edge,
+  // which otherwise causes "lingering" characters after switching visuals.
+  d.fillRect(0, yTop, vizW, d.height() - yTop, TFT_BLACK);
   d.setTextDatum(textdatum_t::top_left);
 
   for (int dc = 0; dc < nStreams; dc++) {
@@ -2001,6 +2227,59 @@ static void drawMp3MatrixRainTick(bool paused, volatile uint32_t *envPtr) {
       d.setTextColor(fg, TFT_BLACK);
       d.drawChar(px, py, drawCh);
     }
+  }
+}
+
+// Simple oscilloscope-style wave visual (5th mode).
+// Clears the full MP3 band every frame to avoid lingering pixels.
+static void drawMp3WaveTick(bool paused, volatile uint32_t *envPtr) {
+  auto &d = M5Cardputer.Display;
+  const int yTop = MP3_VIS_TOP;
+  const int yBot = d.height() - MP3_VIS_BOTTOM_MARGIN;
+  const int vizH = yBot - yTop + 1;
+  const int vizW = d.width();
+  if (vizH < 10 || vizW < 20) {
+    return;
+  }
+
+  uint32_t env = envPtr ? *envPtr : 0u;
+  if (paused) {
+    env = env * 2 / 5;
+  }
+
+  // Map envelope (roughly 0..20000) to pixel amplitude.
+  const int maxAmp = std::max(3, vizH / 3);
+  const int amp = constrain(static_cast<int>(env * static_cast<uint32_t>(maxAmp) / 20000u), 0, maxAmp);
+
+  d.fillRect(0, yTop, vizW, vizH, TFT_BLACK);
+  const int midY = yTop + vizH / 2;
+
+  const uint32_t t = millis();
+  const float ft = static_cast<float>(t) * 0.006f;
+  const float twoPi = 6.2831853f;
+
+  // Draw a polyline with a step to reduce draw calls.
+  const int xStep = 3;
+  int prevX = 0;
+  int prevY = midY;
+  bool havePrev = false;
+  for (int x = 0; x < vizW; x += xStep) {
+    const float phase = ft + static_cast<float>(x) * 0.045f;
+    const int y = midY + static_cast<int>(sinf(phase * 1.0f) * amp);
+    if (y < yTop) {
+      continue;
+    }
+    if (y > yBot) {
+      continue;
+    }
+    if (havePrev) {
+      // Gradient-ish color based on x.
+      const uint16_t col = (x / xStep) & 1 ? 0x07E0 : 0xF81F;  // green/magenta
+      d.drawLine(prevX, prevY, x, y, col);
+    }
+    prevX = x;
+    prevY = y;
+    havePrev = true;
   }
 }
 
@@ -2429,6 +2708,7 @@ static PlayExit playMp3File(const String &path) {
   }
 
   bool paused = false;
+  bool overlayAudioMuted = false;
   uint32_t mp3LastPauseToggleMs = 0;
   Mp3VizMode mp3VizMode = Mp3VizMode::BARS;
   Mp3VizMode mp3PrevVizMode = mp3VizMode;
@@ -2458,16 +2738,21 @@ static PlayExit playMp3File(const String &path) {
 
     if (systemInfoOverlayActive()) {
       const bool mp3HadAudio = !paused && mp3->isRunning();
-      if (mp3HadAudio) {
+      if (mp3HadAudio && !overlayAudioMuted) {
         out->stop();
+        overlayAudioMuted = true;
       }
       drawSystemInfoScreen();
       delay(20);
-      if (mp3HadAudio) {
+      continue;
+    }
+    if (overlayAudioMuted) {
+      if (!paused && mp3->isRunning()) {
         if (out->begin()) {
           applyI2sGainFromSpeakerVolume(out);
         }
       }
+      overlayAudioMuted = false;
       drawMp3ScreenStatic(path);
       if (mp3VizMode == Mp3VizMode::MATRIX) {
         g_mp3MatrixLastAdvanceMs = 0;
@@ -2486,14 +2771,18 @@ static PlayExit playMp3File(const String &path) {
         case Mp3VizMode::MATRIX:
           drawMp3MatrixRainTick(paused, &out->visEnvelope);
           break;
+        case Mp3VizMode::WAVE:
+          drawMp3WaveTick(paused, &out->visEnvelope);
+          break;
       }
-      continue;
     }
 
     const PlayKey pk = mp3PollAllKeys(out, mp3VizMode, duckStaticNeedsRedraw, keyChanged,
                                       mp3LastPauseToggleMs, backArmed, backPrevHeld,
                                       playbackStartMs);
     if (mp3VizMode != mp3PrevVizMode) {
+      const bool matrixTransition =
+          (mp3PrevVizMode == Mp3VizMode::MATRIX) || (mp3VizMode == Mp3VizMode::MATRIX);
       if (mp3PrevVizMode == Mp3VizMode::DUCK_DANCE) {
         mp3GifClose();
       }
@@ -2503,6 +2792,14 @@ static PlayExit playMp3File(const String &path) {
       if (mp3VizMode == Mp3VizMode::MATRIX) {
         g_mx_R = 0;
         g_mp3MatrixLastAdvanceMs = 0;
+      }
+      if (matrixTransition) {
+        // MATRIX uses text glyph rendering and can touch pixels outside the usual band.
+        // Redraw static MP3 chrome on transitions to ensure no residue remains.
+        drawMp3ScreenStatic(path);
+        if (mp3VizMode == Mp3VizMode::DUCK_STILL) {
+          duckStaticNeedsRedraw = true;
+        }
       }
       mp3PrevVizMode = mp3VizMode;
     }
@@ -2570,6 +2867,9 @@ static PlayExit playMp3File(const String &path) {
         break;
       case Mp3VizMode::MATRIX:
         drawMp3MatrixRainTick(paused, &out->visEnvelope);
+        break;
+      case Mp3VizMode::WAVE:
+        drawMp3WaveTick(paused, &out->visEnvelope);
         break;
     }
     drawMp3VolumeHintTick();
@@ -2797,22 +3097,25 @@ void setup() {
   M5Cardputer.begin();
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setBrightness(200);
-  showStartupSplash();
+  drawStartupSplashFrame();
 
   g_mjpegBuf = (uint8_t *)malloc(MJPEG_BUFFER_SIZE);
   g_audioBuf = (uint8_t *)malloc(AUDIO_CHUNK);
   if (!g_mjpegBuf || !g_audioBuf) {
     Serial.println("malloc buffer failed");
+    delay(1600);
     return;
   }
 
   if (!initSd()) {
+    delay(1600);
     M5Cardputer.Display.drawString("SD fail", 4, 4);
     return;
   }
 
   M5Cardputer.Speaker.begin();
   setSpeakerVolumePersisted(kStartupVolumePct * 255 / 100);
+  playSplashJingleFromSdIfPresent();
 
 #if defined(ESP_PLATFORM)
   randomSeed(static_cast<uint32_t>(esp_random()));
