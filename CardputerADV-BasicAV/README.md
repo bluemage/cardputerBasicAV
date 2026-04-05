@@ -7,7 +7,6 @@ Put media on an SD card and open this sketch in the Arduino IDE (or your usual E
 ## Source layout
 
 - **Sketch:** `CardputerADV-BasicAV/CardputerADV-BasicAV.ino` (folder name matches the `.ino` for Arduino).
-- If you keep another copy of the project elsewhere for local builds, treat **this** tree as the one that should match GitHub; sync the `.ino` (and bundled `.cpp`/`.h` next to it) when you change behavior.
 
 ## Dependencies
 
@@ -28,5 +27,3 @@ Sample assets are useful for a first run (splash, jingle, GIF visual, sample cli
 ## SD card layout
 
 Copy an `assets/` folder to the **root** of the SD card so files appear as `/assets/...` (or add your own media at the paths you prefer; the sketch documents defaults in the header comment).
-
-If your sample bundle lives in a sibling folder such as `cardputersaved/assets/`, copy that folder to the card root as `assets/`.
